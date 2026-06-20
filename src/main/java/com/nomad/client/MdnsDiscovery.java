@@ -12,9 +12,15 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * mDNS 发现实现（基于 Android NSD API）。
+ * mDNS 发现与注册实现（基于 Android NSD API）。
  * <p>
  * 对应 Go 代码 nomad/discovery/mdns.go。
+ * <p>
+ * 功能：
+ * <ul>
+ *   <li>服务注册：将自身 Nomad 服务注册到 mDNS 网络</li>
+ *   <li>服务发现：周期性查询局域网中的 Nomad 服务</li>
+ * </ul>
  * <p>
  * 协议细节：
  * <ul>
@@ -22,6 +28,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   <li>TXT 记录: http_port=4646, rpc_port=4647, serf_port=4648</li>
  *   <li>查询间隔: 30 秒</li>
  *   <li>节点超时: 10 分钟</li>
+ *   <li>TTL: 120 秒</li>
  * </ul>
  * <p>
  * 注意：需要 Android Context 来获取 NsdManager。
@@ -48,6 +55,7 @@ public class MdnsDiscovery {
     private final int rpcPort;
     private final int serfPort;
     private final String advertiseAddress;
+    private final boolean shouldRegister;
 
     private final ConcurrentHashMap<String, DiscoveredNode> discoveredNodes = new ConcurrentHashMap<>();
     private final CopyOnWriteArrayList<DiscoveryListener> listeners = new CopyOnWriteArrayList<>();
@@ -56,6 +64,11 @@ public class MdnsDiscovery {
     private NsdManager nsdManager;
     private volatile Thread discoveryThread;
     private volatile Thread cleanupThread;
+
+    // 已注册的 mDNS 服务信息（用于停止时注销）
+    private NsdServiceInfo registeredHttpService;
+    private NsdServiceInfo registeredRpcService;
+    private NsdServiceInfo registeredSerfService;
 
     /**
      * 创建仅发现模式（不注册自身服务）的 mDNS 发现实例。
@@ -92,6 +105,7 @@ public class MdnsDiscovery {
         this.rpcPort = rpcPort;
         this.serfPort = serfPort;
         this.advertiseAddress = advertiseAddress;
+        this.shouldRegister = registerServices;
     }
 
     // ---- 监听器 ----
@@ -107,9 +121,9 @@ public class MdnsDiscovery {
     // ---- 启动/停止 ----
 
     /**
-     * 启动 mDNS 发现。
+     * 启动 mDNS 发现与注册。
      * <p>
-     * 开始周期性查询局域网中的 Nomad 服务。
+     * 如果构造时指定了注册模式，会先注册自身服务，然后开始周期性查询。
      */
     public void start() {
         if (running.getAndSet(true)) {
@@ -124,6 +138,11 @@ public class MdnsDiscovery {
             return;
         }
 
+        // 如果需要，注册自身服务到 mDNS
+        if (shouldRegister) {
+            registerServices();
+        }
+
         // 启动发现线程
         discoveryThread = new Thread(this::discoveryLoop, "nomad-mdns-discover");
         discoveryThread.setDaemon(true);
@@ -134,16 +153,19 @@ public class MdnsDiscovery {
         cleanupThread.setDaemon(true);
         cleanupThread.start();
 
-        Log.d(TAG, "mDNS 发现已启动, 实例=" + instanceName);
+        Log.d(TAG, "mDNS 发现已启动, 实例=" + instanceName + ", 注册=" + shouldRegister);
     }
 
     /**
-     * 停止 mDNS 发现。
+     * 停止 mDNS 发现并注销服务。
      */
     public void stop() {
         if (!running.getAndSet(false)) {
             return;
         }
+
+        // 注销已注册的 mDNS 服务
+        unregisterServices();
 
         if (discoveryThread != null) {
             discoveryThread.interrupt();
@@ -197,12 +219,141 @@ public class MdnsDiscovery {
         return running.get();
     }
 
-    // ---- 内部实现 ----
+    // ---- mDNS 服务注册 ----
+
+    /**
+     * 注册自身 Nomad 服务到 mDNS 网络。
+     * <p>
+     * 注册三个服务：_nomad-http._tcp、_nomad-rpc._tcp、_nomad-serf._tcp，
+     * 每个服务的 TXT 记录包含所有端口信息。
+     * 对应 Go 代码 mdns.go 中的 registerServices()。
+     */
+    private void registerServices() {
+        String addr = advertiseAddress != null ? advertiseAddress : autoDetectLocalIP();
+
+        try {
+            // 注册 _nomad-http._tcp 服务
+            registeredHttpService = createServiceInfo(
+                    instanceName, SERVICE_HTTP, httpPort, addr);
+            nsdManager.registerService(registeredHttpService,
+                    NsdManager.PROTOCOL_DNS_SD, registrationListener);
+
+            // 注册 _nomad-rpc._tcp 服务
+            registeredRpcService = createServiceInfo(
+                    instanceName, SERVICE_RPC, rpcPort, addr);
+            nsdManager.registerService(registeredRpcService,
+                    NsdManager.PROTOCOL_DNS_SD, registrationListener);
+
+            // 注册 _nomad-serf._tcp 服务
+            registeredSerfService = createServiceInfo(
+                    instanceName, SERVICE_SERF, serfPort, addr);
+            nsdManager.registerService(registeredSerfService,
+                    NsdManager.PROTOCOL_DNS_SD, registrationListener);
+
+            Log.d(TAG, "mDNS 服务注册成功: " + instanceName
+                    + " (" + addr + "), http=" + httpPort
+                    + ", rpc=" + rpcPort + ", serf=" + serfPort);
+        } catch (Exception e) {
+            Log.e(TAG, "mDNS 服务注册失败", e);
+        }
+    }
+
+    /**
+     * 创建 NsdServiceInfo，包含 Nomad 端口信息的 TXT 记录。
+     */
+    private NsdServiceInfo createServiceInfo(String name, String type,
+                                             int port, String address) {
+        NsdServiceInfo serviceInfo = new NsdServiceInfo();
+        serviceInfo.setServiceName(name);
+        serviceInfo.setServiceType(type);
+        serviceInfo.setPort(port);
+
+        // 设置 IP 地址
+        try {
+            serviceInfo.setHost(InetAddress.getByName(address));
+        } catch (Exception e) {
+            Log.w(TAG, "设置 mDNS 地址失败: " + address, e);
+        }
+
+        // 设置 TXT 记录 —— 包含所有端口信息
+        // 对应 Go 代码中的 txtRecords map
+        java.util.Map<String, String> txtMap = new java.util.HashMap<>();
+        txtMap.put("http_port", String.valueOf(httpPort));
+        txtMap.put("rpc_port", String.valueOf(rpcPort));
+        txtMap.put("serf_port", String.valueOf(serfPort));
+
+        // Android NSD 的 setAttribute 只支持 String 类型的 value
+        for (Map.Entry<String, String> entry : txtMap.entrySet()) {
+            serviceInfo.setAttribute(entry.getKey(), entry.getValue());
+        }
+
+        return serviceInfo;
+    }
+
+    /**
+     * 注销所有已注册的 mDNS 服务。
+     */
+    private void unregisterServices() {
+        if (nsdManager == null) return;
+
+        try {
+            if (registeredHttpService != null) {
+                nsdManager.unregisterService(registeredHttpService);
+                registeredHttpService = null;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "注销 HTTP 服务失败", e);
+        }
+        try {
+            if (registeredRpcService != null) {
+                nsdManager.unregisterService(registeredRpcService);
+                registeredRpcService = null;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "注销 RPC 服务失败", e);
+        }
+        try {
+            if (registeredSerfService != null) {
+                nsdManager.unregisterService(registeredSerfService);
+                registeredSerfService = null;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "注销 Serf 服务失败", e);
+        }
+
+        Log.d(TAG, "mDNS 服务已注销");
+    }
+
+    /** 服务注册/注销回调 */
+    private final NsdManager.RegistrationListener registrationListener =
+            new NsdManager.RegistrationListener() {
+                @Override
+                public void onServiceRegistered(NsdServiceInfo serviceInfo) {
+                    Log.d(TAG, "mDNS 服务注册成功: " + serviceInfo.getServiceType());
+                }
+
+                @Override
+                public void onRegistrationFailed(NsdServiceInfo serviceInfo, int errorCode) {
+                    Log.e(TAG, "mDNS 服务注册失败: " + serviceInfo.getServiceType()
+                            + ", 错误=" + errorCode);
+                }
+
+                @Override
+                public void onServiceUnregistered(NsdServiceInfo serviceInfo) {
+                    Log.d(TAG, "mDNS 服务已注销: " + serviceInfo.getServiceType());
+                }
+
+                @Override
+                public void onUnregistrationFailed(NsdServiceInfo serviceInfo, int errorCode) {
+                    Log.w(TAG, "mDNS 服务注销失败: " + serviceInfo.getServiceType()
+                            + ", 错误=" + errorCode);
+                }
+            };
+
+    // ---- mDNS 服务发现 ----
 
     /**
      * 发现循环 —— 每 30 秒发起一次 mDNS 查询。
-     * <p>
-     * 使用 Android NsdManager.DiscoveryListener 进行服务发现。
      */
     private void discoveryLoop() {
         // 立即执行一次发现
@@ -223,24 +374,21 @@ public class MdnsDiscovery {
     /**
      * 执行一轮 mDNS 服务发现。
      * <p>
-     * 查询 _nomad-serf._tcp 服务类型，解析后获取节点信息。
+     * 查询三个服务类型，解析后获取节点信息。
      */
     private void performDiscovery() {
         try {
-            // 使用 CountDownLatch 风格的同步发现
-            final java.util.concurrent.atomic.AtomicInteger pendingServices =
-                    new java.util.concurrent.atomic.AtomicInteger(3);
             final java.util.concurrent.CountDownLatch latch =
                     new java.util.concurrent.CountDownLatch(3);
 
             // 查询 SERF 服务（主要，用于 join）
-            discoverService(SERVICE_SERF, pendingServices, latch);
+            discoverService(SERVICE_SERF, latch);
 
             // 查询 RPC 服务
-            discoverService(SERVICE_RPC, pendingServices, latch);
+            discoverService(SERVICE_RPC, latch);
 
             // 查询 HTTP 服务
-            discoverService(SERVICE_HTTP, pendingServices, latch);
+            discoverService(SERVICE_HTTP, latch);
 
             // 等待所有查询完成（最多 5 秒）
             latch.await(5, java.util.concurrent.TimeUnit.SECONDS);
@@ -255,7 +403,6 @@ public class MdnsDiscovery {
     }
 
     private void discoverService(final String serviceType,
-                                  final java.util.concurrent.atomic.AtomicInteger pending,
                                   final java.util.concurrent.CountDownLatch latch) {
         try {
             nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD,
@@ -306,7 +453,6 @@ public class MdnsDiscovery {
                         @Override
                         public void onServiceLost(NsdServiceInfo serviceInfo) {
                             Log.d(TAG, "服务消失: " + serviceInfo.getServiceName());
-                            // 节点超时由 cleanupLoop 处理
                             latch.countDown();
                         }
                     });
@@ -384,7 +530,7 @@ public class MdnsDiscovery {
     private void cleanupLoop() {
         while (running.get()) {
             try {
-                Thread.sleep(30_000); // 每 30 秒清理一次
+                Thread.sleep(30_000);
             } catch (InterruptedException e) {
                 break;
             }
@@ -405,6 +551,26 @@ public class MdnsDiscovery {
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * 自动检测本机 LAN IP（UDP trick）。
+     * <p>
+     * 对应 Go 代码中的 getAdvertiseIP()。
+     */
+    private static String autoDetectLocalIP() {
+        try {
+            java.net.DatagramSocket sock = new java.net.DatagramSocket();
+            try {
+                sock.connect(InetAddress.getByName("8.8.8.8"), 53);
+                return sock.getLocalAddress().getHostAddress();
+            } finally {
+                sock.close();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "自动检测 LAN IP 失败，回退到 127.0.0.1", e);
+            return "127.0.0.1";
         }
     }
 }
